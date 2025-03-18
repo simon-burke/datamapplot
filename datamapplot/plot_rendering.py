@@ -1,46 +1,28 @@
-import numpy as np
-import pandas as pd
+import re
+from functools import partial
+from tempfile import NamedTemporaryFile
+from warnings import warn
 
 import datashader as ds
 import datashader.transfer_functions as tf
+import numpy as np
+import pandas as pd
+import requests
+from datashader.bundling import hammer_bundle
 from datashader.mpl_ext import dsshow
-
-from functools import partial
-
-from sklearn.neighbors import KernelDensity
-from skimage.transform import rescale
-
+from datashader.transfer_functions import spread
+from matplotlib import font_manager, patheffects
 from matplotlib import pyplot as plt
-from matplotlib import font_manager
-from matplotlib import patheffects
+from matplotlib.collections import LineCollection
+from skimage.transform import rescale
+from sklearn.neighbors import KernelDensity, NearestNeighbors
 
 from datamapplot.overlap_computations import get_2d_coordinates
-from datamapplot.text_placement import (
-    estimate_dynamic_font_size,
-    initial_text_location_placement,
-    fix_crossings,
-    adjust_text_locations,
-    estimate_font_size,
-    pylabeladjust_text_locations,
-)
-
-from warnings import warn
-from tempfile import NamedTemporaryFile
-
-import requests
-import re
-
-
-class GoogleAPIUnreachable(Warning):
-    pass
-
-
-def _can_reach_google_fonts(timeout: float = 5.0) -> bool:
-    try:
-        response = requests.get("https://fonts.googleapis.com/css?family=Roboto", timeout=timeout)
-        return response.ok
-    except requests.RequestException:
-        return False
+from datamapplot.text_placement import (adjust_text_locations,
+                                        estimate_dynamic_font_size,
+                                        estimate_font_size, fix_crossings,
+                                        initial_text_location_placement,
+                                        pylabeladjust_text_locations)
 
 
 def get_google_font(fontname):
@@ -61,12 +43,139 @@ def get_google_font(fontname):
         warn(f"Failed in getting google-font {fontname}; using fallback ...")
 
 
+def split_dataframe_on_na(df):
+    # Find rows where all values are NaN
+    nan_rows = df.isna().all(axis=1)
+
+    # Store x and y values as lists
+    x_segments = []
+    y_segments = []
+
+    last_index = 0
+
+    for idx in nan_rows[nan_rows].index:
+        # Collect non-NaN chunk before the current NaN row
+        if last_index < idx:
+            x_segments.append(df.iloc[last_index:idx]["x"].dropna().tolist())
+            y_segments.append(df.iloc[last_index:idx]["y"].dropna().tolist())
+        last_index = idx + 1  # Move to the row after the NaN row
+
+    # Add the final chunk after the last NaN row
+    if last_index < len(df):
+        x_segments.append(df.iloc[last_index:]["x"].dropna().tolist())
+        y_segments.append(df.iloc[last_index:]["y"].dropna().tolist())
+
+    # Construct the dictionary with dynamic column names
+    result_dict = {}
+    for i, (x, y) in enumerate(zip(x_segments, y_segments)):
+        result_dict[f"x{i}"] = [x]
+        result_dict[f"y{i}"] = [y]
+
+    # Create a DataFrame from the dictionary
+    result_df = pd.DataFrame(result_dict)
+
+    return result_df
+
+
+def get_edge_colors(edges, color_list):
+    """
+    Returns the appropriate color for each edge based on the color of the start point in KNN.
+
+    Parameters:
+    - edges (np.ndarray): Array of edges with shape (n_edges, 2), where each row represents [start_idx, end_idx].
+    - color_list (list or np.ndarray): List of colors where color_list[i] gives the color for point i.
+
+    Returns:
+    - edge_colors (list): List of colors for each edge, where the color corresponds to the start point of the edge.
+    """
+    edge_colors = []
+
+    # Iterate over each edge
+    for edge in edges:
+        start_idx = edge[0]  # Get the index of the start point
+        start_color = color_list[start_idx]  # Get the color of the start point
+
+        # Append the start point's color to the list of edge colors
+        edge_colors.append(start_color)
+
+    return edge_colors
+
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def hex_to_rgb(hex_color):
+    """
+    Converts a hex color string to an RGB tuple.
+
+    Parameters:
+    - hex_color (str): A hex color string, e.g., '#FF5733' or '#FF5733FF' for RGBA.
+
+    Returns:
+    - rgb (tuple): A tuple of integers representing the RGB values, e.g., (255, 87, 51) or (255, 87, 51, 255) for RGBA.
+    """
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) == 6:
+        return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))  # RGB
+    elif len(hex_color) == 8:
+        return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4, 6))  # RGBA
+
+
+def rgb_to_hex(rgb):
+    """
+    Converts an RGB or RGBA tuple to a hex color string using f-strings.
+
+    Parameters:
+    - rgb (tuple): A tuple of integers representing the RGB values, e.g., (255, 87, 51) or (255, 87, 51, 255) for RGBA.
+
+    Returns:
+    - hex_color (str): A hex color string, e.g., '#FF5733' or '#FF5733FF' for RGBA.
+    """
+    rgb = tuple(int(round(c)) for c in rgb)
+    if len(rgb) == 3:
+        return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+    elif len(rgb) == 4:
+        return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}{rgb[3]:02x}"
+
+
+def interpolate_colors_2d(points, colors, target_points, k=5, power=2):
+    """
+    Interpolates colors using Inverse Distance Weighting (IDW).
+
+    Parameters:
+    - points (np.ndarray): Coordinates of the original points (shape: (n_points, 2)).
+    - colors (np.ndarray): Colors corresponding to the points (shape: (n_points, 3) or (n_points, 4) for RGBA).
+    - target_points (np.ndarray): The points where we want to interpolate colors (shape: (n_target_points, 2)).
+    - k (int): Number of nearest neighbors to use for interpolation.
+    - power (float): Weighting power (higher values give more influence to closer points).
+
+    Returns:
+    - interpolated_colors (np.ndarray): Interpolated colors for the target points (shape: (n_target_points, 3)).
+    """
+    colors = np.array([hex_to_rgb(color) for color in colors])
+    tree = cKDTree(points)
+    distances, indices = tree.query(target_points, k=k)
+
+    # Inverse distance weighting
+    weights = 1 / np.maximum(distances, 1e-6) ** power  # Avoid division by zero
+    weights /= weights.sum(axis=1)[:, None]  # Normalize weights
+
+    # Interpolate colors based on the weights
+    interpolated_colors = np.einsum("ij,ijk->ik", weights, colors[indices])
+
+    return [rgb_to_hex(interpolated_colors[i]) for i in range(len(interpolated_colors))]
+
+
 def datashader_scatterplot(
     data_map_coords,
     color_list,
     point_size,
     ax,
+    edge_bundling="hammer",  # Edge bundling option
+    k_neighbors=50,  # Number of nearest neighbors
 ):
+    # Create DataFrame for the scatter plot
     data = pd.DataFrame(
         {
             "x": data_map_coords.T[0],
@@ -75,6 +184,9 @@ def datashader_scatterplot(
         }
     )
     color_key = {x: x for x in np.unique(color_list)}
+
+    # Plot the scatterplot
+
     dsshow(
         data,
         ds.Point("x", "y"),
@@ -84,6 +196,162 @@ def datashader_scatterplot(
         ax=ax,
         shade_hook=partial(tf.spread, px=point_size, how="over"),
     )
+
+    # If edge bundling is requested, calculate edges using nearest neighbors and apply bundling
+    if edge_bundling == "hammer":
+        # Use NearestNeighbors to find the nearest neighbors and generate the edges
+        sample = data_map_coords[
+            np.random.choice(range(data_map_coords.shape[0]), 10000, replace=False)
+        ]
+        nbrs = NearestNeighbors(n_neighbors=k_neighbors, algorithm="ball_tree").fit(
+            sample
+        )
+        _, indices = nbrs.kneighbors(sample)
+
+        # Create edge list as index pairs (not coordinates)
+        edges = []
+        for i, neighbors in enumerate(indices):
+            for neighbor in neighbors:
+                if i != neighbor:  # Avoid self-loops
+                    edges.append([i, neighbor])
+
+        # Apply hammer_bundle with node positions (data_map_coords) and edge indices
+        edge_colors = get_edge_colors(edges, color_list)
+        # print(edge_colors)
+
+        def get_distance(edge):
+            x0, y0 = data_map_coords[edge[0]]
+            x1, y1 = data_map_coords[edge[1]]
+            return np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+
+        sample = pd.DataFrame(
+            {
+                "x": sample.T[0],
+                "y": sample.T[1],
+            }
+        )
+        # weights = [get_distance(edge) for edge in edges]
+        # max_weight = max(weights)
+        # weights = [weight / max_weight for weight in weights]
+        edges = pd.DataFrame(
+            {
+                "source": [edge[0] for edge in edges],
+                "target": [edge[1] for edge in edges],
+                # "weight": weights,
+            }
+        )
+
+        # perform edge bundling
+        bundled = hammer_bundle(
+            sample,
+            edges,
+            # weight="weight",
+        )
+        x = bundled["x"].values
+        y = bundled["y"].values
+        lc = []
+        color_idx = 0
+        segment_colors = []
+        for i in range(len(x) - 1):
+            if np.isnan(x[i + 1]) or np.isnan(y[i + 1]):
+                color_idx += 1
+                continue
+            if np.isnan(x[i]) or np.isnan(y[i]):
+                continue
+            lc.append([(x[i], y[i]), (x[i + 1], y[i + 1])])
+            segment_colors.append(edge_colors[color_idx])
+
+        # Compute midpoints of each segment
+        midpoints = []
+        for segment in lc:
+            midpoint = [
+                (segment[0][0] + segment[1][0]) / 2,
+                (segment[0][1] + segment[1][1]) / 2,
+            ]
+            midpoints.append(midpoint)
+
+        # get segment colors based on midpoints
+        segment_colors = interpolate_colors_2d(data_map_coords, color_list, midpoints)
+
+        lc = LineCollection(lc, colors=segment_colors, alpha=0.1, linewidths=1)
+        ax.add_collection(lc)
+        return ax
+
+    return ax
+
+
+def bundle_edges(
+    ax, data_map_coords, color_list, k_neighbors=50, use_sample=-1, edges=None
+):
+
+    # If edge bundling is requested, calculate edges using nearest neighbors and apply bundling
+    # Use NearestNeighbors to find the nearest neighbors and generate the edges
+    if use_sample > -1:
+        sample = data_map_coords[
+            np.random.choice(range(data_map_coords.shape[0]), use_sample, replace=False)
+        ]
+    else:
+        sample = data_map_coords
+    nbrs = NearestNeighbors(n_neighbors=k_neighbors, algorithm="ball_tree").fit(sample)
+    _, indices = nbrs.kneighbors(sample)
+
+    # Create edge list as index pairs (not coordinates)
+    if not edges:
+        edges = []
+        for i, neighbors in enumerate(indices):
+            for neighbor in neighbors:
+                if i != neighbor:  # Avoid self-loops
+                    edges.append([i, neighbor])
+
+    # Apply hammer_bundle with node positions (data_map_coords) and edge indices
+
+    def get_distance(edge):
+        x0, y0 = data_map_coords[edge[0]]
+        x1, y1 = data_map_coords[edge[1]]
+        return np.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+
+    sample = pd.DataFrame(
+        {
+            "x": sample.T[0],
+            "y": sample.T[1],
+        }
+    )
+    edges = pd.DataFrame(
+        {
+            "source": [edge[0] for edge in edges],
+            "target": [edge[1] for edge in edges],
+        }
+    )
+
+    # perform edge bundling
+    bundled = hammer_bundle(
+        sample,
+        edges,
+    )
+    x = bundled["x"].values
+    y = bundled["y"].values
+    lc = []
+    for i in range(len(x) - 1):
+        if np.isnan(x[i + 1]) or np.isnan(y[i + 1]):
+            continue
+        if np.isnan(x[i]) or np.isnan(y[i]):
+            continue
+        lc.append([(x[i], y[i]), (x[i + 1], y[i + 1])])
+
+    # Compute midpoints of each segment
+    midpoints = []
+    for segment in lc:
+        midpoint = [
+            (segment[0][0] + segment[1][0]) / 2,
+            (segment[0][1] + segment[1][1]) / 2,
+        ]
+        midpoints.append(midpoint)
+
+    # get segment colors based on midpoints
+    segment_colors = interpolate_colors_2d(data_map_coords, color_list, midpoints)
+
+    lc = LineCollection(lc, colors=segment_colors, alpha=0.1, linewidths=1)
+    ax.add_collection(lc)
     return ax
 
 
@@ -216,9 +484,6 @@ def render_plot(
     pylabeladjust_adjust_by_size=True,
     pylabeladjust_margin_percentage=7.5,
     pylabeladjust_radius_scale=1.05,
-    label_font_stroke_width=3,
-    label_font_outline_alpha=0.5,
-    ax=None,
     verbose=False,
 ):
     """Render a static data map plot with given colours and label locations and text. This is
@@ -422,22 +687,8 @@ def render_plot(
         positioning when doing labels over points. If ``label_over_points`` is ``False`` then
         this will have no effect.
 
-    label_font_stroke_width: float (optional, default=3)
-        The width of the stroke to use when rendering the font. This is used to create an outline
-        that distinguishes the text from the background. Larger values will make text more visible 
-        against the background at some loss of font legibility. You may need to change this value
-        when rendering at particularly high resolutions.
-
-    label_font_outline_alpha: float (optional, default=0.5)
-        The alpha value to use when rendering the font outline. This is used to create an outline
-        that distinguishes the text from the background. Larger values will make text more visible
-        against the background at some loss of font legibility.
-
     verbose: bool (optional, default=False)
         Print progress as the plot is being created.
-
-    ax: None or matplotlib.axes (optional, default=None)
-        If not None, render the plot to this axis, otherwise create a new figure and axis.
 
     Returns
     -------
@@ -449,32 +700,22 @@ def render_plot(
 
     """
     # Create the figure
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi, constrained_layout=True)
-    else:
-        fig = ax.get_figure()
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi, constrained_layout=True)
 
-
-    if _can_reach_google_fonts(timeout=5.0):
-        if verbose:
-            print("Getting any required fonts...")
-        # Get any google fonts if required
-        get_google_font(font_family)
-        get_google_font(font_family.split()[0])
-        if title_keywords is not None and "fontfamily" in title_keywords:
-            get_google_font(title_keywords["fontfamily"])
-            get_google_font(title_keywords["fontfamily"].split()[0])
-        if sub_title_keywords is not None and "fontfamily" in sub_title_keywords:
-            get_google_font(sub_title_keywords["fontfamily"])
-            get_google_font(sub_title_keywords["fontfamily"].split()[0])
-    else:
-        warn(
-            "Cannot reach out Google APIs to download the font you selected. Will fallback on fonts already installed.",
-            GoogleAPIUnreachable
-        )
+    if verbose:
+        print("Getting any required fonts...")
+    # Get any google fonts if required
+    get_google_font(font_family)
+    get_google_font(font_family.split()[0])
+    if title_keywords is not None and "fontfamily" in title_keywords:
+        get_google_font(title_keywords["fontfamily"])
+        get_google_font(title_keywords["fontfamily"].split()[0])
+    if sub_title_keywords is not None and "fontfamily" in sub_title_keywords:
+        get_google_font(sub_title_keywords["fontfamily"])
+        get_google_font(sub_title_keywords["fontfamily"].split()[0])
 
     # Apply matplotlib or datashader based on heuristics
-    if data_map_coords.shape[0] < 100_000 or force_matplotlib:
+    if data_map_coords.shape[0] < 100_000 and force_matplotlib:
         if marker_size_array is not None:
             point_size = marker_size_array * point_size
         ax.scatter(
@@ -689,8 +930,7 @@ def render_plot(
             else:
                 text_color = "black"
 
-            outline_alpha = hex(int(255 * label_font_outline_alpha)).removeprefix('0x')
-            outline_color = f"#000000{outline_alpha}" if darkmode else f"#ffffff{outline_alpha}"
+            outline_color = "#00000077" if darkmode else "#ffffff77"
 
             if type(label_arrow_colors) == str:
                 arrow_color = label_arrow_colors
@@ -722,15 +962,17 @@ def render_plot(
                         else None
                     ),
                     fontsize=(
-                        highlight_label_keywords.get("fontsize", font_size)
-                        if label_text[i] in highlight
-                        else font_size
-                    )
-                    if font_sizes is None
-                    else font_sizes[i],
+                        (
+                            highlight_label_keywords.get("fontsize", font_size)
+                            if label_text[i] in highlight
+                            else font_size
+                        )
+                        if font_sizes is None
+                        else font_sizes[i]
+                    ),
                     path_effects=(
                         [
-                            patheffects.Stroke(linewidth=label_font_stroke_width, foreground=outline_color),
+                            patheffects.Stroke(linewidth=3, foreground=outline_color),
                             patheffects.Normal(),
                         ]
                         if label_over_points
@@ -741,7 +983,9 @@ def render_plot(
                     fontweight=(
                         highlight_label_keywords.get("fontweight", font_weight)
                         if label_text[i] in highlight
-                        else (font_weights[i] if font_weights is not None else font_weight)
+                        else (
+                            font_weights[i] if font_weights is not None else font_weight
+                        )
                     ),
                 )
             )
