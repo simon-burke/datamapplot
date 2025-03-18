@@ -1,5 +1,5 @@
 
-LAYER_ORDER = ['dataPointLayer', 'boundaryLayer', 'LabelLayer'];
+LAYER_ORDER = ['imageLayer', 'dataPointLayer', 'boundaryLayer', 'labelLayer'];
 
 function getLayerIndex(object) {
   return LAYER_ORDER.indexOf(object.id);
@@ -65,6 +65,7 @@ class DataMap {
     this.searchItemId = searchItemId;
     this.lassoSelectionItemId = lassoSelectionItemId;
     this.pointData = null;
+    this.labelData = null;
     this.metaData = null;
     this.layers = [];
     const { viewportWidth, viewportHeight } = getInitialViewportSize();
@@ -116,6 +117,7 @@ class DataMap {
         sizes[i] = pointData.size[i];
       }
     }
+    this.originalColors = colors;
     this.selected = new Float32Array(numPoints).fill(1.0);
     this.pointSize = pointSize;
     this.pointOutlineColor = pointOutlineColor;
@@ -182,7 +184,9 @@ class DataMap {
     fontWeight = 900,
     lineSpacing = 0.95,
     textCollisionSizeScale = 3.0,
+    pickable = true,
   }) {
+    
     const numLabels = labelData.length;
     this.labelTextColor = labelTextColor;
     this.textMinPixelSize = textMinPixelSize;
@@ -198,9 +202,10 @@ class DataMap {
     waitForFont(this.fontFamily);
 
     this.labelLayer = new deck.TextLayer({
-      id: 'LabelLayer',
+      id: 'labelLayer',
+      // Only add labels with valid x positions.
       data: labelData,
-      pickable: false,
+      pickable: pickable,
       getPosition: d => [d.x, d.y],
       getText: d => d.label,
       getColor: this.labelTextColor,
@@ -305,6 +310,45 @@ class DataMap {
     this.histogramItemId = histogramItem.state.chart.chartContainerId;
   }
 
+  addBackgroundImage(image, bounds) {
+    this.imageLayer = new deck.BitmapLayer({
+      id: 'imageLayer',
+      bounds: bounds,
+      image: image,
+      parameters: {
+        depthTest: false
+      }
+    });
+
+    this.layers.push(this.imageLayer);
+    this.layers.sort((a, b) => getLayerIndex(a) - getLayerIndex(b));
+    this.deckgl.setProps({ layers: [...this.layers] });
+  }
+
+  async addSelectionHandler(callback, selectionKind = "lasso-selection", timeoutMs = 60000) {
+    const startTime = Date.now();
+
+    if (selectionKind === "lasso-selection") {
+      // Wait for the lasso selector to be available
+      while (!this.lassoSelector) {
+        if (Date.now() - startTime > timeoutMs) {
+          throw new Error('Timeout: lassoSelector did not become available within the specified timeout period');
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+
+      this.lassoSelector.registerSelectionHandler(callback);
+    } else {
+      if (!this.selectionCallbacks) {
+        this.selectionCallbacks = {};
+      }
+      if (this.selectionCallbacks[selectionKind]) {
+        this.selectionCallbacks[selectionKind].push(callback);
+      }
+      this.selectionCallbacks[selectionKind] = [callback];
+    }
+  }
+
   highlightPoints(itemId) {
     const selectedIndices = this.dataSelectionManager.getSelectedIndices();
     const semiSelectedIndices = this.dataSelectionManager.getBasicSelectedIndices();
@@ -360,9 +404,11 @@ class DataMap {
     });
 
     const idx = this.layers.indexOf(this.pointLayer);
+    this.layers = [...this.layers.slice(0, idx), updatedPointLayer, ...this.layers.slice(idx + 1)];
     this.deckgl.setProps({
-      layers: [...this.layers.slice(0, idx), updatedPointLayer, ...this.layers.slice(idx + 1)]
+      layers: this.layers
     });
+    this.pointLayer = updatedPointLayer;
 
     // Update histogram, if any
     if (this.histogramItem && itemId !== this.histogramItemId) {
@@ -377,11 +423,25 @@ class DataMap {
   addSelection(selectedIndices, selectionKind) {
     this.dataSelectionManager.addOrUpdateSelectedIndicesOfItem(selectedIndices, selectionKind);
     this.highlightPoints(selectionKind);
+
+    if (this.selectionCallbacks && this.selectionCallbacks[selectionKind]) {
+      const currentSelectedIndices = Array.from(this.dataSelectionManager.getSelectedIndices());
+      for (let callback of this.selectionCallbacks[selectionKind]) {
+        callback(currentSelectedIndices);
+      }
+    }
   }
 
   removeSelection(selectionKind) {
     this.dataSelectionManager.removeSelectedIndicesOfItem(selectionKind);
     this.highlightPoints(selectionKind);
+
+    if (this.selectionCallbacks && this.selectionCallbacks[selectionKind]) {
+      const currentSelectedIndices = Array.from(this.dataSelectionManager.getSelectedIndices());
+      for (let callback of this.selectionCallbacks[selectionKind]) {
+        callback(currentSelectedIndices);
+      }
+    }
   }
 
   getSelectedIndices() {
@@ -401,6 +461,80 @@ class DataMap {
     } else {
       this.dataSelectionManager.addOrUpdateSelectedIndicesOfItem(selectedIndices, this.searchItemId);
     }
+    if (this.selectionCallbacks && this.selectionCallbacks[this.searchItemId]) {
+      const currentSelectedIndices = Array.from(this.dataSelectionManager.getSelectedIndices());
+      for (let callback of this.selectionCallbacks[this.searchItemId]) {
+        callback(currentSelectedIndices);
+      }
+    }
     this.highlightPoints(this.searchItemId);
+  }
+
+  recolorPoints(colorData, fieldName) {
+    if (!this.hasOwnProperty(`${fieldName}Colors`)) {
+      const numPoints = colorData[`${fieldName}_r`].length;
+      const colors = new Uint8Array(numPoints * 4);
+      for (let i = 0; i < numPoints; i++) {
+        colors[i * 4] = colorData[`${fieldName}_r`][i];
+        colors[i * 4 + 1] = colorData[`${fieldName}_g`][i];
+        colors[i * 4 + 2] = colorData[`${fieldName}_b`][i];
+        colors[i * 4 + 3] = colorData[`${fieldName}_a`][i];
+      }
+      this[`${fieldName}Colors`] = colors;
+    }
+
+    const updatedPointLayer = this.pointLayer.clone({
+      data: {
+        ...this.pointLayer.props.data,
+        attributes: {
+          ...this.pointLayer.props.data.attributes,
+          getFillColor: { value: this[`${fieldName}Colors`], size: 4 }
+        }
+      },
+      transitions: {
+        getFillColor: {
+          duration: 1500,
+          easing: d3.easeCubicInOut
+        }
+      }
+    });
+    
+    // Increment update trigger
+    this.updateTriggerCounter++;
+
+    const idx = this.layers.indexOf(this.pointLayer);
+    this.layers = [...this.layers.slice(0, idx), updatedPointLayer, ...this.layers.slice(idx + 1)];
+    this.deckgl.setProps({
+      layers: this.layers
+    });
+    this.pointLayer = updatedPointLayer;
+  }
+
+  resetPointColors() {
+    const updatedPointLayer = this.pointLayer.clone({
+      data: {
+        ...this.pointLayer.props.data,
+        attributes: {
+          ...this.pointLayer.props.data.attributes,
+          getFillColor: { value: this.originalColors, size: 4 }
+        }
+      },
+      transitions: {
+        getFillColor: {
+          duration: 1500,
+          easing: d3.easeCubicInOut
+        }
+      }
+    });
+    
+    // Increment update trigger
+    this.updateTriggerCounter++;
+
+    const idx = this.layers.indexOf(this.pointLayer);
+    this.layers = [...this.layers.slice(0, idx), updatedPointLayer, ...this.layers.slice(idx + 1)];
+    this.deckgl.setProps({
+      layers: this.layers
+    });
+    this.pointLayer = updatedPointLayer;
   }
 }
