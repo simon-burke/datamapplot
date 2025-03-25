@@ -4,16 +4,19 @@ import pandas as pd
 import datashader as ds
 import datashader.transfer_functions as tf
 from datashader.mpl_ext import dsshow
+from datashader.bundling import hammer_bundle
 
 from functools import partial
 from tempfile import NamedTemporaryFile
 
-from sklearn.neighbors import KernelDensity
+from sklearn.neighbors import KernelDensity, NearestNeighbors
 from skimage.transform import rescale
+from scipy.interpolate import RegularGridInterpolator
 
 from matplotlib import font_manager
 from matplotlib import pyplot as plt
 from matplotlib import patheffects
+from matplotlib.collections import LineCollection
 
 from datamapplot.overlap_computations import get_2d_coordinates
 from datamapplot.text_placement import (
@@ -43,12 +46,22 @@ def manage_google_font(fontname):
         f.close()
         font_manager.fontManager.addfont(f.name)
 
+def convert_lines_dtype(df):
+    df["group_no"] = df.isnull().all(axis=1).cumsum()
+    df = df.dropna()
+    x_values = np.array(df['x'])
+    y_values = np.array(df['y'])
+    groups = np.array(df['group_no'])
+    n_rows = np.max(np.unique(x_values))
+
 
 def datashader_scatterplot(
     data_map_coords,
     color_list,
     point_size,
     ax,
+    lines=None,
+    line_colors=None
 ):
     data = pd.DataFrame(
         {
@@ -57,17 +70,179 @@ def datashader_scatterplot(
             "label": pd.Categorical(color_list),
         }
     )
+    lines = np.array(lines)
+    print(len(line_colors))
+    lines_data = pd.DataFrame({
+        'x' : lines[:,0],
+        'x1' : lines[:,2],
+        'y' : lines[:,1],
+        'y1' : lines[:,3],
+        'color': pd.Categorical(line_colors)
+    })
+
+
     color_key = {x: x for x in np.unique(color_list)}
+    print(color_key)
+    lines_color_key = {x: x for x in np.unique(line_colors)}
+    dsshow(
+        lines_data,
+        ds.glyphs.LinesAxis1(['x', 'x1'], ['y', 'y1']),
+        ds.count_cat('color'),
+        color_key=lines_color_key,
+        ax=ax,
+    )
+
     dsshow(
         data,
         ds.Point("x", "y"),
         ds.count_cat("label"),
         color_key=color_key,
-        norm="eq_hist",
+        #norm="eq_hist",
         ax=ax,
-        shade_hook=partial(tf.spread, px=point_size, how="over"),
+        shade_hook=partial(tf.spread, px=1, how="over"),
     )
+
     return ax
+
+
+def _hex_to_rgb(hex_color):
+    """
+    Converts a hex color string to an RGB tuple.
+
+    Parameters:
+    - hex_color (str): A hex color string, e.g., '#FF5733' or '#FF5733FF' for RGBA.
+
+    Returns:
+    - rgb (tuple): A tuple of integers representing the RGB values, e.g., (255, 87, 51) or (255, 87, 51, 255) for RGBA.
+    """
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) == 6:
+        return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))  # RGB
+    elif len(hex_color) == 8:
+        return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4, 6))  # RGBA
+
+
+def _rgb_to_hex(rgb):
+    """
+    Converts an RGB or RGBA tuple to a hex color string using f-strings.
+
+    Parameters:
+    - rgb (tuple): A tuple of integers representing the RGB values, e.g., (255, 87, 51) or (255, 87, 51, 255) for RGBA.
+
+    Returns:
+    - hex_color (str): A hex color string, e.g., '#FF5733' or '#FF5733FF' for RGBA.
+    """
+    rgb = tuple(int(30 *round(c / 30)) for c in rgb)
+    if len(rgb) == 3:
+        return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+    elif len(rgb) == 4:
+        return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}{rgb[3]:02x}"
+
+
+def _interpolate_colors(tree, colors, target_points, k=10, power=1):
+    """
+    Interpolates colors using Inverse Distance Weighting (IDW).
+
+    Parameters:
+    - points (np.ndarray): Coordinates of the original points (shape: (n_points, 2)).
+    - colors (np.ndarray): Colors corresponding to the points (shape: (n_points, 3) or (n_points, 4) for RGBA).
+    - target_points (np.ndarray): The points where we want to interpolate colors (shape: (n_target_points, 2)).
+    - k (int): Number of nearest neighbors to use for interpolation.
+    - power (float): Weighting power (higher values give more influence to closer points).
+
+    Returns:
+    - interpolated_colors (np.ndarray): Interpolated colors for the target points (shape: (n_target_points, 3)).
+    """
+    colors = np.array([_hex_to_rgb(color) for color in colors])
+    distances, indices = tree.kneighbors(target_points, n_neighbors=k)
+
+    # Inverse distance weighting
+    weights = 1 / np.maximum(distances, 1e-6) ** power  # Avoid division by zero
+    weights /= weights.sum(axis=1)[:, None]  # Normalize weights
+
+    # Interpolate colors based on the weights
+    interpolated_colors = np.einsum("ij,ijk->ik", weights, colors[indices])
+    return [_rgb_to_hex(interpolated_colors[i]) for i in range(len(interpolated_colors))]
+
+
+def _interpolate_colors2(tree, points, colors, target_points, nn=100):
+    grid_x = np.linspace(points[:, 0].min(), points[:, 0].max(), 100)
+    grid_y = np.linspace(points[:, 1].min(), points[:, 1].max(), 100) 
+    grid_xx, grid_yy = np.meshgrid(grid_x, grid_y, indexing='ij')
+    grid_points = np.vstack([grid_xx.ravel(), grid_yy.ravel()]).T
+
+    print("constructing color grid")
+
+    colors = np.array([_hex_to_rgb(color) for color in colors])
+    distances, indices = tree.kneighbors(grid_points, n_neighbors=nn)
+    weights = 1 / np.maximum(distances, 1e-6) ** 1  # Avoid division by zero
+    weights /= weights.sum(axis=1)[:, None]  #
+    grid_colors = np.einsum("ij,ijk->ik", weights, colors[indices])
+    grid_colors = grid_colors.reshape(len(grid_x), len(grid_y), 3)
+
+
+    # Interpolation function
+    color_interpolator = RegularGridInterpolator((grid_x,grid_y), grid_colors)
+    print("querying color grid")
+    segment_colors = color_interpolator(target_points)
+    return [_rgb_to_hex(segment_colors[i]) for i in range(len(segment_colors))]
+
+
+
+
+
+
+def bundle_edges(data_map_coords, color_list, n_neighbors=10, sample_size=None):
+    """Use hammer edge bundling on nearest neighbors"""
+    if sample_size:
+        bundle_points = data_map_coords[
+            np.random.choice(range(data_map_coords.shape[0]), sample_size, replace=False)
+        ]
+    else:
+        bundle_points = data_map_coords
+    nbrs = NearestNeighbors(n_neighbors=max(n_neighbors, 100), algorithm="ball_tree").fit(
+        bundle_points
+    )
+    dists, indices = nbrs.kneighbors(bundle_points, n_neighbors=n_neighbors)
+
+    edges = []
+    for i, neighbors in enumerate(indices):
+        for neighbor in neighbors:
+            if i != neighbor:  # Do not include self
+                edges.append([i, neighbor])
+
+    bundle_points = pd.DataFrame({"x": data_map_coords.T[0], "y": data_map_coords.T[1]})
+    edges = pd.DataFrame(
+        {
+            "source": [edge[0] for edge in edges],
+            "target": [edge[1] for edge in edges],
+        }
+    )
+    # Perform edge bundling
+    bundled = hammer_bundle(bundle_points, edges, use_dask=False)
+
+    print("parsing lines")
+    bundled["is_valid"] = bundled.isnull().all(axis=1).cumsum()
+    bundled = bundled.dropna()
+    x = bundled["x"][:-1].values
+    y = bundled["y"][:-1].values
+    x1 = bundled["x"][1:].values
+    y1 = bundled["y"][1:].values
+    is_valid = bundled["is_valid"][1:].values == bundled["is_valid"][:-1].values
+    segments = np.array([x, y, x1, y1]).T[is_valid]
+    #x = bundled["x"].values
+    #y = bundled["y"].values
+
+    midpoints = np.array([(segments[:,0]+segments[:,2]) / 2, (segments[:,1] + segments[:,3]) / 2]).T
+
+    # Compute line segment color based on midpoint
+    print("interpolating colors")
+    segment_colors = _interpolate_colors2(NearestNeighbors(n_neighbors=100, algorithm="ball_tree", n_jobs=-1).fit(data_map_coords), data_map_coords, color_list, midpoints)
+    #segment_colors = _interpolate_colors(NearestNeighbors(n_neighbors=100, algorithm="ball_tree", n_jobs=-1).fit(
+    #    data_map_coords), color_list, midpoints, k=100)
+
+
+    return segments, segment_colors
 
 
 def add_glow_to_scatterplot(
@@ -212,6 +387,7 @@ def render_plot(
     label_font_outline_alpha=0.5,
     ax=None,
     verbose=False,
+    edge_bundle=False
 ):
     """Render a static data map plot with given colours and label locations and text. This is
     a lower level function, and should usually not be used directly unless there are specific
@@ -465,6 +641,12 @@ def render_plot(
         )
 
     # Apply matplotlib or datashader based on heuristics
+    if edge_bundle:
+        print("bundling edges")
+        lines, colors = bundle_edges(data_map_coords, color_list, n_neighbors=25, sample_size=5000)
+        #lc = LineCollection(lines, colors=colors, linewidths=1, alpha=0.1)
+        #ax.add_collection(lc)
+        
     if data_map_coords.shape[0] < 100_000 or force_matplotlib:
         if marker_size_array is not None:
             point_size = marker_size_array * point_size
@@ -481,9 +663,10 @@ def render_plot(
             warn(
                 "Adjusting marker type or size cannot be done with datashader; use force_matplotlib=True"
             )
-        datashader_scatterplot(
-            data_map_coords, color_list, point_size=point_size, ax=ax
-        )
+        if edge_bundle:
+            datashader_scatterplot(
+                data_map_coords, color_list, point_size=point_size, ax=ax, lines=lines, line_colors=colors
+            )
 
     # Create background glow
     if verbose:
@@ -842,5 +1025,8 @@ def render_plot(
     if darkmode:
         ax.set(facecolor="black")
         fig.set(facecolor="black")
+
+
+
 
     return fig, ax
