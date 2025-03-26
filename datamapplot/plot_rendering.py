@@ -139,31 +139,6 @@ def _rgb_to_hex(rgb):
         return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}{rgb[3]:02x}"
 
 
-def _interpolate_colors(tree, colors, target_points, k=10, power=1):
-    """
-    Interpolates colors using Inverse Distance Weighting (IDW).
-
-    Parameters:
-    - points (np.ndarray): Coordinates of the original points (shape: (n_points, 2)).
-    - colors (np.ndarray): Colors corresponding to the points (shape: (n_points, 3) or (n_points, 4) for RGBA).
-    - target_points (np.ndarray): The points where we want to interpolate colors (shape: (n_target_points, 2)).
-    - k (int): Number of nearest neighbors to use for interpolation.
-    - power (float): Weighting power (higher values give more influence to closer points).
-
-    Returns:
-    - interpolated_colors (np.ndarray): Interpolated colors for the target points (shape: (n_target_points, 3)).
-    """
-    colors = np.array([_hex_to_rgb(color) for color in colors])
-    distances, indices = tree.kneighbors(target_points, n_neighbors=k)
-
-    # Inverse distance weighting
-    weights = 1 / np.maximum(distances, 1e-6) ** power  # Avoid division by zero
-    weights /= weights.sum(axis=1)[:, None]  # Normalize weights
-
-    # Interpolate colors based on the weights
-    interpolated_colors = np.einsum("ij,ijk->ik", weights, colors[indices])
-    return [_rgb_to_hex(interpolated_colors[i]) for i in range(len(interpolated_colors))]
-
 
 def _interpolate_colors2(tree, points, colors, target_points, nn=100):
     grid_x = np.linspace(points[:, 0].min(), points[:, 0].max(), 100)
@@ -192,7 +167,7 @@ def _interpolate_colors2(tree, points, colors, target_points, nn=100):
 
 
 
-def bundle_edges(data_map_coords, color_list, n_neighbors=10, sample_size=None):
+def bundle_edges(data_map_coords, color_list, n_neighbors=10, sample_size=None, color_map_nn=100):
     """Use hammer edge bundling on nearest neighbors"""
     if sample_size:
         bundle_points = data_map_coords[
@@ -200,10 +175,10 @@ def bundle_edges(data_map_coords, color_list, n_neighbors=10, sample_size=None):
         ]
     else:
         bundle_points = data_map_coords
-    nbrs = NearestNeighbors(n_neighbors=max(n_neighbors, 100), algorithm="ball_tree").fit(
+    nbrs = NearestNeighbors(n_neighbors=max(n_neighbors, color_map_nn), algorithm="ball_tree").fit(
         bundle_points
     )
-    dists, indices = nbrs.kneighbors(bundle_points, n_neighbors=n_neighbors)
+    _, indices = nbrs.kneighbors(bundle_points, n_neighbors=n_neighbors)
 
     edges = []
     for i, neighbors in enumerate(indices):
