@@ -34,6 +34,8 @@ from datamapplot.fonts import (
     GoogleAPIUnreachable,
 )
 from warnings import warn
+import matplotlib
+matplotlib.use('Agg')
 
 
 cfg = ConfigManager()
@@ -83,7 +85,9 @@ def datashader_scatterplot(
 
     color_key = {x: x for x in np.unique(color_list)}
     print(color_key)
+
     lines_color_key = {x: x for x in np.unique(line_colors)}
+    print("test")
     dsshow(
         lines_data,
         ds.glyphs.LinesAxis1(['x', 'x1'], ['y', 'y1']),
@@ -212,7 +216,7 @@ def bundle_edges(data_map_coords, color_list, n_neighbors=10, sample_size=None, 
 
     # Compute line segment color based on midpoint
     print("interpolating colors")
-    segment_colors = _interpolate_colors2(NearestNeighbors(n_neighbors=100, algorithm="ball_tree", n_jobs=-1).fit(data_map_coords), data_map_coords, color_list, midpoints)
+    segment_colors = _interpolate_colors2(nbrs, data_map_coords, color_list, midpoints)
     #segment_colors = _interpolate_colors(NearestNeighbors(n_neighbors=100, algorithm="ball_tree", n_jobs=-1).fit(
     #    data_map_coords), color_list, midpoints, k=100)
 
@@ -618,7 +622,7 @@ def render_plot(
     # Apply matplotlib or datashader based on heuristics
     if edge_bundle:
         print("bundling edges")
-        lines, colors = bundle_edges(data_map_coords, color_list, n_neighbors=25, sample_size=5000)
+        lines, colors = bundle_edges(data_map_coords, color_list, n_neighbors=15)
         #lc = LineCollection(lines, colors=colors, linewidths=1, alpha=0.1)
         #ax.add_collection(lc)
         
