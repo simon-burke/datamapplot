@@ -521,9 +521,11 @@ def render_plot(
     if data_map_coords.shape[0] < 100_000 or force_matplotlib:
         if marker_size_array is not None:
             point_size = marker_size_array * point_size
+        
         if edge_bundle:
             lc = LineCollection(lines.reshape((-1,2,2)), colors=colors, linewidths=matplotlib_lineswidth)
             ax.add_collection(lc)
+
         ax.scatter(
             *data_map_coords.T,
             c=color_list,
